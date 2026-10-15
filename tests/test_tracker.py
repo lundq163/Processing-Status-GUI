@@ -11,11 +11,11 @@ from PyQt6.QtWidgets import QApplication
 
 import pipeline_tracker as pt
 
-DATA = ROOT / "data_that_work"
-SAMPLES = ROOT / "csvs_to_test"
-BS_RESULTS = SAMPLES / "brainswipes" / "brainswipes__30July__audit__results.csv"
-BS_PASSABLE = SAMPLES / "brainswipes" / "brainswipes__30July__audit__passable.csv"
-XCPD_ERRORS = SAMPLES / "xcpd_errors" / "xcpd__0.10.7__errors__no_low_motion_runs.csv"
+DATA = ROOT / "all_datasheets"
+SAMPLES = DATA
+BS_RESULTS = SAMPLES / "brainswipes__30July__audit__results.csv"
+BS_PASSABLE = SAMPLES / "brainswipes__30July__audit__passable.csv"
+XCPD_ERRORS = SAMPLES / "xcpd__0.10.7__errors__no_low_motion_runs.csv"
 
 
 @pytest.fixture(scope="session")
@@ -141,7 +141,7 @@ def test_errors_are_per_version_and_deduplicated(window):
     assert s.stage_status["XCP-D"] == "error" and s.current_stage == "XCP-D"
 
     # a different version is unaffected by those errors
-    window.import_file(str(SAMPLES / "xcpd_errors" / "xcpd__anat_rerun__errors__no_low_motion_runs.csv"))
+    window.import_file(str(SAMPLES / "xcpd__anat_rerun__errors__no_low_motion_runs.csv"))
     window.active_versions["XCP-D"] = "anat_rerun"
     window.recompute()
     assert "anat_rerun" in window.versions("XCP-D")
@@ -201,7 +201,7 @@ def test_every_sample_file_follows_schema_and_imports(window):
 
 def import_errors(w):
     w.import_file(str(XCPD_ERRORS))
-    w.import_file(str(SAMPLES / "xcpd_errors" / "xcpd__anat_rerun__errors__no_low_motion_runs.csv"))
+    w.import_file(str(SAMPLES / "xcpd__anat_rerun__errors__no_low_motion_runs.csv"))
     w.refresh_all()
 
 

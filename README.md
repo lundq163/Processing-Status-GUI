@@ -7,7 +7,8 @@ PyQt6 app that tracks BCP sessions through the processing pipeline and lets you 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python pipeline_tracker.py --participants_tsv data_that_work/bcp_participants.tsv
+python pipeline_tracker.py --participants_tsv all_datasheets/bcp_participants.tsv
+python pipeline_tracker.py --participants_tsv all_datasheets/bcp_participants.tsv --data_dir all_datasheets
 python pipeline_tracker.py --help
 ```
 
@@ -17,6 +18,8 @@ python pipeline_tracker.py --help
 | `--data_dir DIR` | Import every schema-named CSV under DIR at startup (recursive). |
 | `--session FILE` | Restore a saved session (see below). |
 | `--stages ...` | Limit the pipeline columns. |
+
+`all_datasheets/` holds the sample participants file and example CSVs (every file already follows the naming schema), so the commands above work as is. The tests use it too.
 
 ## CSV naming schema
 
