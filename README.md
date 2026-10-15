@@ -88,6 +88,6 @@ Imports check columns and give a specific message when a file lacks participant/
 ## Tests
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pytest tests
 ```
