@@ -1,2 +1,3 @@
-/.venv
-/rae_scripts
+.venv/
+__pycache__/
+.pytest_cache/
