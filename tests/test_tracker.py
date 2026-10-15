@@ -195,3 +195,147 @@ def test_every_sample_file_follows_schema_and_imports(window):
     for view in (window.show_pipeline_view, window.show_overview,
                  window.show_error_summary, window.show_brainswipes_view):
         view()
+
+
+# ---- filters, export, summary, comparison, sessions, validation --------------------------
+
+def import_errors(w):
+    w.import_file(str(XCPD_ERRORS))
+    w.import_file(str(SAMPLES / "xcpd_errors" / "xcpd__anat_rerun__errors__no_low_motion_runs.csv"))
+    w.refresh_all()
+
+
+def test_filters(window):
+    total = len(window.sessions)
+    assert len(window.filtered_sessions()) == total
+    first = sorted(window.sessions)[0]
+    window.filters.update(text=first[0])
+    assert all(s.participant_id == first[0] for s in window.filtered_sessions())
+    window.filters.update(text="", stage="Complete")
+    assert {s.current_stage for s in window.filtered_sessions()} == {"Complete"}
+    window.filters.update(stage="Any", status="error")
+    assert all(window.current_status(s) == "error" for s in window.filtered_sessions())
+    window.filters.update(status="Any", notes=True)
+    assert window.filtered_sessions() == []
+
+
+def test_filter_widgets_drive_pipeline_view(window):
+    window.filter_stage.setCurrentText("Complete")
+    assert window.filters["stage"] == "Complete"
+    window.clear_filters()
+    assert window.filters == pt.PipelineConfig.DEFAULT_FILTERS
+
+
+def test_error_filter(window):
+    import_errors(window)
+    window.active_versions["XCP-D"] = "0.10.7"
+    window.recompute()
+    names = window.error_csv_names()
+    assert names
+    window.filters["error"] = names[0]
+    assert window.filtered_sessions()
+
+
+def test_export_current_view(window):
+    import pandas as pd
+    out = window.tmp_path / "view.csv"
+    window.filters["stage"] = "Complete"
+    window.export_current_view(str(out))
+    df = pd.read_csv(out)
+    assert set(df["current_stage"]) == {"Complete"}
+    assert {"participant_id", "session_id", "XCP-D_version", "XCP-D_status", "n_errors"} <= set(df.columns)
+
+
+def test_summary(window):
+    d = window.summary_data()
+    assert d["total"] == len(window.sessions)
+    assert d["complete"] + len(d["incomplete"]) == d["total"]
+    text = window.summary_text()
+    assert "Per stage and version" in text and "0.10.7*" in text
+    paths = window.save_summary(str(window.tmp_path / "rep.txt"))
+    import pandas as pd
+    assert len(pd.read_csv(paths[1])) == len(d["incomplete"])
+
+
+def test_version_comparison(window):
+    import_errors(window)
+    rows = window.compare_versions("XCP-D", "0.10.7", "anat_rerun")
+    assert rows and all(r["status_a"] != r["status_b"] for r in rows)
+    assert {r["change"] for r in rows} <= {"only_in_a", "only_in_b", "improved", "regressed", "changed"}
+    window.switch_view("Version Comparison")
+    window.comparison.update(stage="XCP-D", a="0.10.7", b="anat_rerun")
+    out = window.tmp_path / "cmp.csv"
+    window.view_combo.setCurrentText("Version Comparison")
+    window.export_current_view(str(out))
+    assert out.exists()
+
+
+def test_all_views_render(window):
+    import_errors(window)
+    for view in ["Pipeline View", "Overview", "Error Summary", "BrainSwipes QC",
+                 "Version Comparison", "Summary"]:
+        window.view_combo.setCurrentText(view)
+
+
+def test_save_and_load_session(window, app):
+    import_errors(window)
+    window.import_file(str(BS_RESULTS))
+    window.active_versions["XCP-D"] = "anat_rerun"
+    window.recompute()
+    before = {k: (s.current_stage, dict(s.stage_status)) for k, s in window.sessions.items()}
+    path = window.save_session(str(window.tmp_path / "s.json"))
+
+    fresh = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
+    assert fresh.load_session(path) == []
+    assert fresh.active_versions["XCP-D"] == "anat_rerun"
+    assert {k: (s.current_stage, dict(s.stage_status)) for k, s in fresh.sessions.items()} == before
+
+
+def test_load_session_reports_missing_file(window):
+    path = window.save_session(str(window.tmp_path / "s.json"))
+    import json
+    data = json.loads(Path(path).read_text())
+    data["imports"][0].update(path="/nope/x.csv", relative="nope/x.csv")
+    Path(path).write_text(json.dumps(data))
+    messages = window.load_session(path)
+    assert len(messages) == 1 and "not found" in messages[0]
+
+
+def test_import_folder(app):
+    w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
+    summaries = w.import_folder(str(SAMPLES))
+    assert any("FAILED" not in t and "skipped" not in t for t in summaries)
+    assert {"25.0.1", "anat_only", "corrected_anat_runs", "extra_mcribs"} <= set(w.versions("Nibabies"))
+
+
+def test_import_folder_skips_unnamed_files(app, tmp_path):
+    (tmp_path / "random.csv").write_text("a,b\n1,2\n")
+    w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
+    summaries = w.import_folder(str(tmp_path))
+    assert "does not follow the schema" in summaries[0] and "xcpd" in summaries[0]
+
+
+def test_column_validation(window, tmp_path):
+    bad = tmp_path / "xcpd__v9__audit.csv"
+    bad.write_text("foo,bar\n1,2\n")
+    with pytest.raises(ValueError, match="participant column"):
+        window.import_file(str(bad))
+    bad2 = tmp_path / "xcpd__v10__audit.csv"
+    bad2.write_text("participant_id,session_id,x\nsub-1,ses-1,2\n")
+    with pytest.raises(ValueError, match="at least one of"):
+        window.import_file(str(bad2))
+
+
+def test_cli_accepts_participants_tsv_and_alias(monkeypatch):
+    import argparse
+    seen = {}
+    monkeypatch.setattr(pt, "QApplication", lambda *a: (_ for _ in ()).throw(SystemExit(0)))
+    for flag in ("--participants_tsv", "--input", "--participants-tsv"):
+        monkeypatch.setattr(sys, "argv", ["x", flag, str(DATA / "bcp_participants.tsv")])
+        with pytest.raises(SystemExit) as e:
+            pt.main()
+        assert e.value.code == 0
+    monkeypatch.setattr(sys, "argv", ["x"])
+    with pytest.raises(SystemExit) as e:
+        pt.main()
+    assert e.value.code == 2

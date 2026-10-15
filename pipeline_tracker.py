@@ -7,7 +7,13 @@ Date: October 2025
 """
 
 import sys
+import os
+import re
+import json
+from collections import Counter
+from datetime import datetime
 import argparse
+import textwrap
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -18,7 +24,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QGroupBox, QGridLayout, QFrame, QMessageBox,
     QLineEdit, QSizePolicy, QHeaderView
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QColor, QPalette, QFont
 
 
@@ -73,6 +79,9 @@ class PipelineConfig:
         "brainswipes": "BrainSwipes QC",
         "notes": "Notes",
     }
+
+    # Initial values of the Pipeline View filter bar
+    DEFAULT_FILTERS = {"text": "", "stage": "Any", "status": "Any", "error": "Any", "notes": False}
 
     # Header tooltips
     STAGE_NOTES = {
@@ -181,6 +190,21 @@ def filter_brainswipes(sessions, recon=None, overall=None, minimums=None, maximu
     return out
 
 
+PID_KEYS = ['participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub']
+SID_KEYS = ['session_id', 'Session_IDs', 'session', 'ses', 'sess']
+STATUS_COLUMNS = ['pending', 'success', 'errored']
+ERROR_COLUMNS = ['Run_Number', 'Error_Log_Paths']
+FILENAME_SCHEMA = "{stage}__{version}__{audit|errors}[__label].csv"
+
+
+def schema_help() -> str:
+    """Accepted filename pattern and stage tokens, for validation messages."""
+    return (f"Expected {FILENAME_SCHEMA} with stage one of: "
+            + ", ".join(PipelineConfig.STAGE_TOKENS) + " (errors only for "
+            + ", ".join(t for t, st in PipelineConfig.STAGE_TOKENS.items()
+                        if st in PipelineConfig.VERSIONED_STAGES) + ")")
+
+
 class ImportReport:
     """Collects what an import did so the user can see what was skipped and why."""
 
@@ -189,6 +213,10 @@ class ImportReport:
     def __init__(self):
         self.updated = 0
         self.skipped: Dict[str, List[str]] = {}
+        self.warnings: List[str] = []
+
+    def warn(self, message: str):
+        self.warnings.append(message)
 
     def skip(self, reason: str, label: str):
         self.skipped.setdefault(reason, []).append(str(label))
@@ -198,6 +226,7 @@ class ImportReport:
         for reason, labels in self.skipped.items():
             example = ", ".join(labels[:3])
             lines.append(f"Skipped {len(labels)}: {reason} (e.g. {example})")
+        lines.extend(f"Warning: {w}" for w in self.warnings)
         return "\n".join(lines)
 
 
@@ -471,8 +500,7 @@ class PipelineTrackerWindow(QMainWindow):
         Normalizes to BIDS format (sub-XXX, ses-XXX) if needed.
         Returns (pid, sid) or None if not found.
         """
-        pid_keys = ['participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub']
-        sid_keys = ['session_id', 'Session_IDs', 'session', 'ses', 'sess']
+        pid_keys, sid_keys = PID_KEYS, SID_KEYS
         pid = None
         sid = None
         # pandas Series supports `in` for labels; also row.get works
@@ -499,16 +527,29 @@ class PipelineTrackerWindow(QMainWindow):
         self.stages = stages if stages else PipelineConfig.STAGES
         self.active_versions = {}  # stage -> selected pipeline version
         self.current_view = "Pipeline"  # "Pipeline" | "Overview" | "Errors" | "BrainSwipes"
-        
-        # Load initial sessions
-        self.load_initial_sessions(initial_csv)
-        for session in self.sessions.values():
-            session.active_versions = self.active_versions
-        self.recompute()
+        self.import_log: List[Dict[str, str]] = []  # files imported so far, for saved sessions
+        self.unknown_by_file: Dict[str, List[str]] = {}  # file -> sessions not in participants.tsv
+        self.filters = dict(PipelineConfig.DEFAULT_FILTERS)
+        self.comparison = {"stage": None, "a": None, "b": None}
+        self.participants_tsv = str(Path(initial_csv).resolve())
+
+        self.reset_sessions(initial_csv)
         
         self.setWindowTitle("Processing Stage Tracker")
         self.setMinimumSize(1200, 800)
         self.setup_ui()
+
+    def reset_sessions(self, tsv_path: str):
+        """Starts from a clean state with the sessions of a participants.tsv."""
+        self.sessions = {}
+        self.active_versions.clear()
+        self.import_log = []
+        self.unknown_by_file = {}
+        self.participants_tsv = str(Path(tsv_path).resolve())
+        self.load_initial_sessions(tsv_path)
+        for session in self.sessions.values():
+            session.active_versions = self.active_versions
+        self.recompute()
 
     def versions(self, stage: str) -> List[str]:
         """Pipeline versions that have been imported for a stage (in import order)."""
@@ -592,6 +633,7 @@ class PipelineTrackerWindow(QMainWindow):
     def warn_unknown_sessions(self, filename: str, report: ImportReport):
         """Prints sessions that are not in the canonical participants.tsv to the terminal."""
         unknown = sorted(set(report.skipped.get(ImportReport.UNKNOWN, [])))
+        self.unknown_by_file[filename] = unknown
         if unknown:
             print(f"[WARNING] {filename}: {len(unknown)} session(s) not in participants.tsv:",
                   file=sys.stderr)
@@ -649,7 +691,8 @@ class PipelineTrackerWindow(QMainWindow):
         menu_layout.addWidget(view_label)
         
         self.view_combo = QComboBox()
-        self.view_combo.addItems(["Pipeline View", "Overview", "Error Summary", "BrainSwipes QC"])
+        self.view_combo.addItems(["Pipeline View", "Overview", "Error Summary", "BrainSwipes QC",
+                                  "Version Comparison", "Summary"])
         self.view_combo.currentTextChanged.connect(self.switch_view)
         menu_layout.addWidget(self.view_combo)
         
@@ -664,9 +707,25 @@ class PipelineTrackerWindow(QMainWindow):
         import_error_btn.clicked.connect(lambda: self.import_csv(kind="errors"))
         menu_layout.addWidget(import_error_btn)
         
+        import_folder_btn = QPushButton("Import Folder")
+        import_folder_btn.clicked.connect(lambda: self.import_folder())
+        menu_layout.addWidget(import_folder_btn)
+
+        export_view_btn = QPushButton("Export Current View")
+        export_view_btn.clicked.connect(lambda: self.export_current_view())
+        menu_layout.addWidget(export_view_btn)
+
         export_btn = QPushButton("Export Complete Sessions")
         export_btn.clicked.connect(self.export_complete_sessions)
         menu_layout.addWidget(export_btn)
+
+        save_btn = QPushButton("Save Session")
+        save_btn.clicked.connect(lambda: self.save_session())
+        menu_layout.addWidget(save_btn)
+
+        load_btn = QPushButton("Load Session")
+        load_btn.clicked.connect(self.load_session_clicked)
+        menu_layout.addWidget(load_btn)
         
         main_layout.addLayout(menu_layout)
 
@@ -674,6 +733,10 @@ class PipelineTrackerWindow(QMainWindow):
         self.version_layout = QHBoxLayout()
         main_layout.addLayout(self.version_layout)
         self.rebuild_version_controls()
+
+        self.filter_bar = self.build_filter_bar()
+        main_layout.addWidget(self.filter_bar)
+        self.rebuild_filter_options()
         
         # Content area (will be populated based on view)
         self.content_widget = QWidget()
@@ -684,6 +747,7 @@ class PipelineTrackerWindow(QMainWindow):
     
     def switch_view(self, view_name: str):
         """Switches between different views."""
+        self.filter_bar.setVisible(view_name == "Pipeline View")
         if view_name == "Pipeline View":
             self.show_pipeline_view()
         elif view_name == "Overview":
@@ -692,6 +756,10 @@ class PipelineTrackerWindow(QMainWindow):
             self.show_error_summary()
         elif view_name == "BrainSwipes QC":
             self.show_brainswipes_view()
+        elif view_name == "Version Comparison":
+            self.show_comparison_view()
+        elif view_name == "Summary":
+            self.show_summary_view()
     
     def show_pipeline_view(self):
         """Shows the main pipeline view with each session as a row and stages as columns."""
@@ -711,7 +779,9 @@ class PipelineTrackerWindow(QMainWindow):
                 table.horizontalHeaderItem(col_idx).setToolTip(note)
 
         # Stable ordering of sessions for rows
-        session_keys = sorted(self.sessions.keys(), key=lambda k: (k[0], k[1]))
+        shown = self.filtered_sessions()
+        session_keys = [(s.participant_id, s.session_id) for s in shown]
+        layout.addWidget(QLabel(f"Showing {len(shown)} of {len(self.sessions)} sessions"))
         table.setRowCount(len(session_keys))
 
         # Set vertical headers to session display names
@@ -954,38 +1024,74 @@ class PipelineTrackerWindow(QMainWindow):
         """Imports one or more CSVs. Files named {stage}__{version}__{audit|errors}[__label].csv
         are routed automatically; any other file prompts for stage, version and type."""
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Import CSV(s)", "", "CSV Files (*.csv)")
-        if not file_paths:
-            return
+        if file_paths:
+            self.show_summaries("Import summary", self.import_paths(file_paths, kind))
 
+    def import_paths(self, file_paths: List[str], kind: str = None, ask: bool = True) -> List[str]:
+        """Imports files, returning one summary per file. With ask=False, files that do not follow
+        the naming schema are skipped instead of prompting."""
         summaries = []
         for file_path in file_paths:
+            name = Path(file_path).name
             spec = parse_csv_filename(file_path)
             if spec is None:
-                spec = self.ask_import_spec(Path(file_path).name, kind)
+                spec = self.ask_import_spec(name, kind) if ask else None
                 if spec is None:
-                    summaries.append(f"{Path(file_path).name}: cancelled")
+                    reason = "cancelled" if ask else f"skipped, name does not follow the schema. {schema_help()}"
+                    summaries.append(f"{name}: {reason}")
                     continue
             try:
                 report = self.import_file(file_path, spec)
-                summaries.append(f"{Path(file_path).name} ({spec['stage']} {spec['version']} "
-                                 f"{spec['kind']})\n{report.summary()}")
+                summaries.append(f"{name} ({spec['stage']} {spec['version']} {spec['kind']})\n"
+                                 f"{report.summary()}")
             except Exception as e:
-                summaries.append(f"{Path(file_path).name}: FAILED - {e}")
+                summaries.append(f"{name}: FAILED - {e}")
+        self.refresh_all()
+        return summaries
 
+    def import_folder(self, folder: str = None) -> List[str]:
+        """Imports every CSV under a folder (recursively) that follows the naming schema."""
+        if folder is None:
+            folder = QFileDialog.getExistingDirectory(self, "Import folder of CSVs")
+            if not folder:
+                return []
+        files = sorted(str(f) for f in Path(folder).rglob("*.csv"))
+        summaries = self.import_paths(files, ask=False)
+        if not files:
+            summaries = [f"No CSV files found in {folder}"]
+        if self.isVisible():
+            self.show_summaries("Folder import summary", summaries)
+        return summaries
+
+    def show_summaries(self, title: str, summaries: List[str]):
+        failed = sum(1 for t in summaries if "FAILED" in t or "skipped" in t or "cancelled" in t)
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(f"{len(summaries)} file(s) processed, {failed} skipped or failed.")
+        box.setDetailedText("\n\n".join(summaries))
+        box.exec()
+
+    def refresh_all(self):
+        """Rebuilds version pickers and filter options, then redraws the current view."""
+        if not hasattr(self, "version_layout"):
+            return
         self.rebuild_version_controls()
+        self.rebuild_filter_options()
         self.switch_view(self.view_combo.currentText())
-        QMessageBox.information(self, "Import summary", "\n\n".join(summaries))
 
     def import_file(self, file_path: str, spec: Dict[str, str] = None) -> ImportReport:
         """Imports one CSV using its filename schema (or an explicit spec), then refreshes sessions."""
         spec = spec or parse_csv_filename(file_path)
         if spec is None:
-            raise ValueError(
-                f"'{Path(file_path).name}' does not match {{stage}}__{{version}}__{{audit|errors}}[__label].csv")
+            raise ValueError(f"'{Path(file_path).name}' does not follow the naming schema. {schema_help()}")
         if spec["kind"] == "errors":
             report = self.process_error_csv(file_path, spec["stage"], spec["version"])
         else:
             report = self.process_csv_import(file_path, spec["stage"], spec["version"])
+        entry = {"path": str(Path(file_path).resolve()), "stage": spec["stage"],
+                 "version": spec["version"], "kind": spec["kind"], "label": spec.get("label", "")}
+        if entry not in self.import_log:
+            self.import_log.append(entry)
         return report
 
     def process_csv_import(self, file_path: str, stage: str, version: str = "default") -> ImportReport:
@@ -1005,10 +1111,19 @@ class PipelineTrackerWindow(QMainWindow):
         self.warn_unknown_sessions(Path(file_path).name, report)
         return report
 
-    def _read_rows(self, file_path: str, report: ImportReport):
-        """Yields (session, row) for rows that match a known session; records the rest in report."""
+    def _read_rows(self, file_path: str, report: ImportReport, any_of: List[str] = None):
+        """Yields (session, row) for rows that match a known session; records the rest in report.
+        Raises a ValueError naming the missing columns if the file lacks ID columns or none of
+        the `any_of` columns."""
         df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
         df.columns = df.columns.str.strip()
+        name, found = Path(file_path).name, ", ".join(df.columns) or "(none)"
+        if not any(c in df.columns for c in PID_KEYS) or not any(c in df.columns for c in SID_KEYS):
+            raise ValueError(f"{name} needs a participant column (one of {', '.join(PID_KEYS)}) and a "
+                             f"session column (one of {', '.join(SID_KEYS)}). Found: {found}")
+        if any_of and not any(c in df.columns for c in any_of):
+            raise ValueError(f"{name} needs at least one of these columns: {', '.join(any_of)}. "
+                             f"Found: {found}")
         self._current_columns = list(df.columns)
         for idx, row in df.iterrows():
             ids = self._extract_ids(row)
@@ -1069,7 +1184,7 @@ class PipelineTrackerWindow(QMainWindow):
         """Imports a pending/success/errored tracking CSV for BIBSNet, Nibabies or XCP-D."""
         id_like = {'participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub',
                    'session_id', 'Session_IDs', 'session', 'ses', 'sess'}
-        for session, row in self._read_rows(file_path, report):
+        for session, row in self._read_rows(file_path, report, any_of=STATUS_COLUMNS):
             session.update_stage_data(stage, version,
                                       {c: row[c] for c in self._current_columns if c not in id_like})
             flag = lambda col: str(row.get(col, '')).strip().upper() == 'TRUE'
@@ -1119,7 +1234,7 @@ class PipelineTrackerWindow(QMainWindow):
         """Associates rows of an error-query CSV with sessions for a stage and pipeline version."""
         report = ImportReport()
         filename = Path(file_path).name
-        for session, row in self._read_rows(file_path, report):
+        for session, row in self._read_rows(file_path, report, any_of=ERROR_COLUMNS):
             session.add_error(stage, version, {
                 'Error_Query_CSV': filename,
                 'Run_Number': row.get('Run_Number', 'N/A'),
@@ -1138,6 +1253,7 @@ class PipelineTrackerWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.addWidget(QLabel(f"'{filename}' does not follow<br>"
                                 "<code>{stage}__{version}__{audit|errors}[__label].csv</code>"))
+        layout.addWidget(QLabel("Choose how to import it, or skip it. Rename it to avoid this prompt."))
 
         stage_combo = QComboBox()
         stage_combo.addItems(PipelineConfig.VERSIONED_STAGES + PipelineConfig.OVERLAY_STAGES)
@@ -1170,6 +1286,384 @@ class PipelineTrackerWindow(QMainWindow):
             QMessageBox.warning(self, "Not supported", f"{stage} does not take error CSVs.")
             return None
         return {"stage": stage, "version": version, "kind": kind_combo.currentText(), "label": ""}
+
+    # ------------------------------------------------------------------
+    # Filtering and tabular export
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def current_status(session: SessionData) -> str:
+        return session.stage_status.get(session.current_stage) or "pending"
+
+    def filtered_sessions(self) -> List[SessionData]:
+        """Sessions matching the Pipeline View filter bar, sorted by ID."""
+        f = self.filters
+        terms = [t.lower() for t in re.split(r"[,\s]+", f["text"]) if t]
+        result = []
+        for key in sorted(self.sessions):
+            session = self.sessions[key]
+            if terms and not any(t in session.get_display_name().lower() for t in terms):
+                continue
+            if f["stage"] != "Any" and session.current_stage != f["stage"]:
+                continue
+            if f["status"] != "Any" and self.current_status(session) != f["status"]:
+                continue
+            if f["error"] != "Any" and not any(
+                    e.get("Error_Query_CSV") == f["error"]
+                    for errs in session.errors.values() for e in errs):
+                continue
+            if f["notes"] and not session.notes:
+                continue
+            result.append(session)
+        return result
+
+    def error_csv_names(self) -> List[str]:
+        names = {e.get("Error_Query_CSV", "Unknown") for s in self.sessions.values()
+                 for errs in s.errors.values() for e in errs}
+        return sorted(names)
+
+    def build_filter_bar(self) -> QWidget:
+        bar = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.filter_text = QLineEdit()
+        self.filter_text.setPlaceholderText("Search sessions (IDs, space or comma separated)")
+        self.filter_stage = QComboBox()
+        self.filter_stage.addItems(["Any"] + self.stages)
+        self.filter_status = QComboBox()
+        self.filter_status.addItems(["Any", "success", "error", "pending"])
+        self.filter_error = QComboBox()
+        self.filter_notes = QCheckBox("Has notes")
+        clear = QPushButton("Clear filters")
+        for label, widget in (("Stage:", self.filter_stage), ("Status:", self.filter_status),
+                              ("Error type:", self.filter_error)):
+            layout.addWidget(QLabel(label))
+            layout.addWidget(widget)
+        layout.insertWidget(0, self.filter_text, 1)
+        layout.addWidget(self.filter_notes)
+        layout.addWidget(clear)
+        bar.setLayout(layout)
+
+        self.filter_text.textChanged.connect(self.on_filter_changed)
+        for combo in (self.filter_stage, self.filter_status, self.filter_error):
+            combo.currentTextChanged.connect(self.on_filter_changed)
+        self.filter_notes.toggled.connect(self.on_filter_changed)
+        clear.clicked.connect(self.clear_filters)
+        return bar
+
+    def rebuild_filter_options(self):
+        """Refreshes the error-type choices (they depend on the selected pipeline versions)."""
+        if not hasattr(self, "filter_error"):
+            return
+        self.filter_error.blockSignals(True)
+        self.filter_error.clear()
+        self.filter_error.addItems(["Any"] + self.error_csv_names())
+        index = self.filter_error.findText(self.filters["error"])
+        self.filter_error.setCurrentIndex(max(index, 0))
+        self.filter_error.blockSignals(False)
+        self.filters["error"] = self.filter_error.currentText()
+
+    def on_filter_changed(self, *_):
+        self.filters = {"text": self.filter_text.text(), "stage": self.filter_stage.currentText(),
+                        "status": self.filter_status.currentText(),
+                        "error": self.filter_error.currentText() or "Any",
+                        "notes": self.filter_notes.isChecked()}
+        if self.view_combo.currentText() == "Pipeline View":
+            self.show_pipeline_view()
+
+    def clear_filters(self):
+        for widget, value in ((self.filter_stage, "Any"), (self.filter_status, "Any"),
+                              (self.filter_error, "Any")):
+            widget.setCurrentText(value)
+        self.filter_notes.setChecked(False)
+        self.filter_text.clear()
+
+    def session_rows(self, sessions: List[SessionData]) -> List[Dict]:
+        """One flat row per session (selected versions) for CSV export and reports."""
+        rows = []
+        for s in sessions:
+            row = {"participant_id": s.participant_id, "session_id": s.session_id,
+                   "current_stage": s.current_stage, "current_status": self.current_status(s)}
+            for stage in PipelineConfig.VERSIONED_STAGES:
+                if stage in self.stages:
+                    row[f"{stage}_version"] = self.active_versions.get(stage, "")
+                    row[f"{stage}_status"] = s.stage_status.get(stage, "no data")
+            row["brainswipes_qc"] = {"success": "pass", "error": "fail"}.get(
+                s.stage_status.get("BrainSwipes QC"), "")
+            error_csvs = sorted({e.get("Error_Query_CSV", "Unknown")
+                                 for errs in s.errors.values() for e in errs})
+            row["n_errors"] = sum(len(errs) for errs in s.errors.values())
+            row["error_csvs"] = "; ".join(error_csvs)
+            row["notes"] = "; ".join(s.notes)
+            rows.append(row)
+        return rows
+
+    def write_rows(self, rows: List[Dict], file_path: str):
+        pd.DataFrame(rows).to_csv(file_path, index=False)
+
+    def _choose_save(self, title: str, default: str, pattern: str = "CSV Files (*.csv)") -> Optional[str]:
+        path, _ = QFileDialog.getSaveFileName(self, title, default, pattern)
+        return path or None
+
+    def export_current_view(self, file_path: str = None):
+        """Exports whatever the current view shows: filtered sessions, the BrainSwipes selection,
+        the version comparison, or the summary report."""
+        view = self.view_combo.currentText()
+        if view == "BrainSwipes QC":
+            return self.export_brainswipes_selection(file_path)
+        if view == "Summary":
+            path = file_path or self._choose_save("Save summary report", "pipeline_summary.txt",
+                                                  "Text Files (*.txt)")
+            return self.save_summary(path) if path else None
+        if view == "Version Comparison":
+            rows, default = self.comparison_rows(), "version_comparison.csv"
+        else:
+            rows, default = self.session_rows(self.filtered_sessions()), "sessions_view.csv"
+        if not rows:
+            QMessageBox.warning(self, "No Data", "There are no rows to export in this view.")
+            return None
+        path = file_path or self._choose_save("Export current view", default)
+        if not path:
+            return None
+        self.write_rows(rows, path)
+        if file_path is None:
+            QMessageBox.information(self, "Exported", f"Exported {len(rows)} row(s) to {path}")
+        return path
+
+    # ------------------------------------------------------------------
+    # Summary report
+    # ------------------------------------------------------------------
+
+    def summary_data(self) -> Dict:
+        sessions = list(self.sessions.values())
+        stage_counts = []
+        for stage in PipelineConfig.VERSIONED_STAGES:
+            if stage not in self.stages:
+                continue
+            for version in self.versions(stage):
+                counts = Counter()
+                for s in sessions:
+                    run = s.runs.get(stage, {}).get(version)
+                    counts[(run["status"] or "pending") if run else "no data"] += 1
+                stage_counts.append({"stage": stage, "version": version,
+                                     "active": self.active_versions.get(stage) == version, **counts})
+        incomplete = [s for s in sessions if s.current_stage != "Complete"]
+        return {
+            "total": len(sessions),
+            "complete": len(sessions) - len(incomplete),
+            "incomplete": incomplete,
+            "incomplete_by_stage": Counter(s.current_stage for s in incomplete),
+            "stage_counts": stage_counts,
+            "unknown": {f: names for f, names in self.unknown_by_file.items() if names},
+            "with_notes": sum(1 for s in sessions if s.notes),
+        }
+
+    def summary_text(self) -> str:
+        d = self.summary_data()
+        lines = ["BCP Processing Summary", f"Generated: {datetime.now():%Y-%m-%d %H:%M}",
+                 f"Participants file: {self.participants_tsv}",
+                 "Active versions: " + (", ".join(f"{s}={v}" for s, v in self.active_versions.items())
+                                        or "none imported"),
+                 "", f"Sessions in participants.tsv: {d['total']}",
+                 f"Complete (XCP-D success): {d['complete']}",
+                 f"Not yet complete: {len(d['incomplete'])}"]
+        for stage in self.stages:
+            if d["incomplete_by_stage"].get(stage):
+                lines.append(f"    stopped at {stage}: {d['incomplete_by_stage'][stage]}")
+        lines += ["", "Per stage and version (all sessions; * = selected version)",
+                  f"{'stage':<10}{'version':<24}{'success':>8}{'error':>8}{'pending':>9}{'no data':>9}"]
+        for c in d["stage_counts"]:
+            mark = "*" if c["active"] else " "
+            lines.append(f"{c['stage']:<10}{(c['version'] + mark):<24}{c.get('success', 0):>8}"
+                         f"{c.get('error', 0):>8}{c.get('pending', 0):>9}{c.get('no data', 0):>9}")
+        lines += ["", f"Sessions with notes: {d['with_notes']}"]
+        if d["unknown"]:
+            lines += ["", "Sessions found in input CSVs but not in participants.tsv:"]
+            for filename, names in d["unknown"].items():
+                lines.append(f"  {filename}: {len(names)}")
+        return "\n".join(lines)
+
+    def save_summary(self, file_path: str) -> List[str]:
+        """Writes the report and a sibling *_incomplete.csv listing sessions that are not Complete."""
+        path = Path(file_path)
+        path.write_text(self.summary_text() + "\n")
+        incomplete = path.with_name(path.stem + "_incomplete.csv")
+        self.write_rows(self.session_rows(self.summary_data()["incomplete"]), str(incomplete))
+        return [str(path), str(incomplete)]
+
+    def show_summary_view(self):
+        if self.content_widget.layout():
+            QWidget().setLayout(self.content_widget.layout())
+        layout = QVBoxLayout()
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont("Courier"))
+        text.setPlainText(self.summary_text())
+        layout.addWidget(text)
+        save = QPushButton("Save report (+ incomplete sessions CSV)")
+        save.clicked.connect(lambda: self.export_current_view())
+        layout.addWidget(save)
+        self.content_widget.setLayout(layout)
+
+    # ------------------------------------------------------------------
+    # Cross-version comparison
+    # ------------------------------------------------------------------
+
+    def compare_versions(self, stage: str, a: str, b: str) -> List[Dict]:
+        """Sessions whose status differs between pipeline versions a and b of a stage."""
+        rows = []
+        for key in sorted(self.sessions):
+            s = self.sessions[key]
+            ra, rb = s.runs.get(stage, {}).get(a), s.runs.get(stage, {}).get(b)
+            sa = (ra["status"] or "pending") if ra else "no data"
+            sb = (rb["status"] or "pending") if rb else "no data"
+            if sa == sb:
+                continue
+            if sa == "no data":
+                change = "only_in_b"
+            elif sb == "no data":
+                change = "only_in_a"
+            elif sb == "success":
+                change = "improved"
+            elif sa == "success":
+                change = "regressed"
+            else:
+                change = "changed"
+            rows.append({"participant_id": s.participant_id, "session_id": s.session_id,
+                         "stage": stage, "version_a": a, "status_a": sa,
+                         "version_b": b, "status_b": sb, "change": change})
+        return rows
+
+    def comparison_rows(self) -> List[Dict]:
+        c = self.comparison
+        if not (c["stage"] and c["a"] and c["b"]):
+            return []
+        return self.compare_versions(c["stage"], c["a"], c["b"])
+
+    def show_comparison_view(self):
+        if self.content_widget.layout():
+            QWidget().setLayout(self.content_widget.layout())
+        layout = QVBoxLayout()
+        stages = [s for s in PipelineConfig.VERSIONED_STAGES if s in self.stages and self.versions(s)]
+        if not stages:
+            layout.addWidget(QLabel("Import at least one pipeline version to compare."))
+            self.content_widget.setLayout(layout)
+            return
+
+        c = self.comparison
+        if c["stage"] not in stages:
+            c.update(stage=stages[0], a=None, b=None)
+        versions = self.versions(c["stage"])
+        if c["a"] not in versions or c["b"] not in versions:
+            c["a"], c["b"] = versions[0], versions[1] if len(versions) > 1 else versions[0]
+
+        controls = QHBoxLayout()
+        pickers = []
+        for label, items, current, field in (("Stage:", stages, c["stage"], "stage"),
+                                             ("Version A:", versions, c["a"], "a"),
+                                             ("Version B:", versions, c["b"], "b")):
+            combo = QComboBox()
+            combo.addItems(items)
+            combo.setCurrentText(current)
+            combo.currentTextChanged.connect(lambda v, f=field: self.set_comparison(f, v))
+            controls.addWidget(QLabel(label))
+            controls.addWidget(combo)
+            pickers.append(combo)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        rows = self.comparison_rows()
+        counts = Counter(r["change"] for r in rows)
+        summary = ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in sorted(counts.items())) or "no differences"
+        layout.addWidget(QLabel(f"{c['stage']}: A = {c['a']}, B = {c['b']}. Sessions that differ: "
+                                f"{len(rows)} ({summary})"))
+        table = QTableWidget()
+        headers = ["participant_id", "session_id", "status_a", "status_b", "change"]
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(["Participant", "Session", f"A: {c['a']}", f"B: {c['b']}", "Change"])
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for col, key in enumerate(headers):
+                table.setItem(r, col, QTableWidgetItem(row[key]))
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table)
+        self.content_widget.setLayout(layout)
+
+    def set_comparison(self, field: str, value: str):
+        if field == "stage":
+            self.comparison.update(stage=value, a=None, b=None)
+        else:
+            self.comparison[field] = value
+        QTimer.singleShot(0, self.show_comparison_view)
+
+    # ------------------------------------------------------------------
+    # Saved sessions
+    # ------------------------------------------------------------------
+
+    def save_session(self, file_path: str = None) -> Optional[str]:
+        """Saves the participants file, imported CSVs and selected versions as JSON."""
+        file_path = file_path or self._choose_save("Save session", "tracker_session.json",
+                                                   "Session Files (*.json)")
+        if not file_path:
+            return None
+        base = Path(file_path).resolve().parent
+        rel = lambda p: os.path.relpath(p, base)
+        data = {"format": 1, "participants_tsv": self.participants_tsv,
+                "participants_tsv_relative": rel(self.participants_tsv),
+                "active_versions": dict(self.active_versions),
+                "imports": [{**e, "relative": rel(e["path"])} for e in self.import_log]}
+        Path(file_path).write_text(json.dumps(data, indent=2))
+        return file_path
+
+    @staticmethod
+    def _locate(path: str, relative: str, base: Path) -> Optional[Path]:
+        for candidate in (Path(path), base / relative if relative else None):
+            if candidate and candidate.exists():
+                return candidate
+        return None
+
+    def load_session(self, file_path: str = None, participants_tsv: str = None) -> List[str]:
+        """Restores a saved session (re-importing its CSVs); returns one message per problem/file."""
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Load session", "", "Session Files (*.json)")
+            if not file_path:
+                return []
+        data = json.loads(Path(file_path).read_text())
+        base = Path(file_path).resolve().parent
+        tsv = Path(participants_tsv) if participants_tsv else self._locate(
+            data["participants_tsv"], data.get("participants_tsv_relative"), base)
+        if tsv is None or not tsv.exists():
+            raise FileNotFoundError(f"participants.tsv not found: {data['participants_tsv']}")
+
+        self.reset_sessions(str(tsv))
+        messages = []
+        for entry in data.get("imports", []):
+            found = self._locate(entry["path"], entry.get("relative"), base)
+            if found is None:
+                msg = f"{Path(entry['path']).name}: file not found, skipped ({entry['path']})"
+                print(f"[WARNING] {msg}", file=sys.stderr)
+                messages.append(msg)
+                continue
+            spec = {k: entry.get(k, "") for k in ("stage", "version", "kind", "label")}
+            try:
+                self.import_file(str(found), spec)
+            except Exception as e:
+                messages.append(f"{found.name}: FAILED - {e}")
+        for stage, version in data.get("active_versions", {}).items():
+            if version in self.versions(stage):
+                self.active_versions[stage] = version
+        self.recompute()
+        self.refresh_all()
+        return messages
+
+    def load_session_clicked(self):
+        try:
+            messages = self.load_session()
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", str(e))
+            return
+        if messages:
+            QMessageBox.warning(self, "Session loaded with problems", "\n".join(messages))
 
     def export_complete_sessions(self):
         """Exports CSV of all sessions that have reached Complete stage."""
@@ -1206,61 +1700,80 @@ class PipelineTrackerWindow(QMainWindow):
 def main():
     """Main entry point for the application."""
     parser = argparse.ArgumentParser(
-        description='Neuroimaging Pipeline Tracker GUI',
+        description='BCP Processing Status GUI: tracks sessions through MRIQC, BIBSNet, NiBabies '
+                    'and XCP-D from audit/error CSVs and BrainSwipes QC results.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python pipeline_tracker.py --input participants.tsv --stages Setup MRIQC BIBSNet Nibabies XCP-D Complete
-  python pipeline_tracker.py --input participants.tsv
-  
-Note: The input file must be a BIDS-compliant participants.tsv file (tab-separated) 
-      with 'participant_id' and 'session_id' columns.
+  python pipeline_tracker.py --participants_tsv participants.tsv
+  python pipeline_tracker.py --participants_tsv participants.tsv --data_dir ./audit_outputs
+  python pipeline_tracker.py --session tracker_session.json
+
+CSV files must be named {stage}__{version}__{audit|errors}[__label].csv
+(stage: mriqc, bibsnet, nibabies, xcpd, brainswipes, notes). See README.md.
         """
     )
-    
+
     parser.add_argument(
-        '--input',
-        required=True,
-        help='Path to BIDS participants.tsv file containing participant_id and session_id columns'
+        '--participants_tsv', '--participants-tsv', '--input',
+        dest='participants_tsv',
+        help='Path to the canonical BIDS participants.tsv (participant_id and session_id columns). '
+             'Required unless --session is given. (--input is a deprecated alias.)'
     )
-    
+    parser.add_argument(
+        '--data_dir', '--data-dir',
+        dest='data_dir',
+        help='Folder of CSVs to import at startup (searched recursively; names must follow the schema)'
+    )
+    parser.add_argument(
+        '--session',
+        help='Saved session (.json, from "Save Session") to restore at startup'
+    )
     parser.add_argument(
         '--stages',
         nargs='+',
         default=None,
         help='List of pipeline stages to include (default: all stages)'
     )
-    
+
     args = parser.parse_args()
-    
-    # Validate input file exists
-    if not Path(args.input).exists():
-        print(f"Error: Input file '{args.input}' does not exist")
-        sys.exit(1)
-    
-    # Validate it's a .tsv file
-    if not args.input.endswith('.tsv'):
-        print(f"Error: Input file must be a BIDS participants.tsv file (tab-separated values)")
-        print(f"Got: {args.input}")
-        sys.exit(1)
-    
-    # Validate stages if provided
+
+    if not args.participants_tsv and not args.session:
+        parser.error("--participants_tsv is required (or pass --session)")
+    if args.participants_tsv:
+        if not Path(args.participants_tsv).exists():
+            parser.error(f"participants file '{args.participants_tsv}' does not exist")
+        if not args.participants_tsv.endswith('.tsv'):
+            parser.error(f"participants file must be a .tsv (tab-separated), got: {args.participants_tsv}")
+    if args.session and not Path(args.session).exists():
+        parser.error(f"session file '{args.session}' does not exist")
+    if args.data_dir and not Path(args.data_dir).is_dir():
+        parser.error(f"data folder '{args.data_dir}' does not exist")
     if args.stages:
         invalid_stages = [s for s in args.stages if s not in PipelineConfig.STAGES]
         if invalid_stages:
-            print(f"Error: Invalid stages: {invalid_stages}")
-            print(f"Valid stages: {PipelineConfig.STAGES}")
-            sys.exit(1)
-    
-    # Create and run application
+            parser.error(f"invalid stages {invalid_stages}; valid stages: {PipelineConfig.STAGES}")
+
+    tsv = args.participants_tsv
+    if not tsv:
+        tsv = json.loads(Path(args.session).read_text()).get("participants_tsv")
+
     app = QApplication(sys.argv)
-    
-    # Set application style
     app.setStyle('Fusion')
-    
-    window = PipelineTrackerWindow(args.input, args.stages)
+
+    window = PipelineTrackerWindow(tsv, args.stages)
     window.show()
-    
+    try:
+        if args.session:
+            for message in window.load_session(args.session, args.participants_tsv):
+                print(f"[WARNING] {message}", file=sys.stderr)
+        if args.data_dir:
+            for line in window.import_folder(args.data_dir):
+                if "FAILED" in line or "skipped" in line:
+                    print(f"[WARNING] {line}", file=sys.stderr)
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+
     sys.exit(app.exec())
 
 
@@ -1327,7 +1840,7 @@ REQUIREMENTS:
 - argparse (standard library)
 
 USAGE:
-python pipeline_tracker.py --input participants.tsv --stages Setup MRIQC BIBSNet Complete
+python pipeline_tracker.py --participants_tsv participants.tsv --stages Setup MRIQC BIBSNet Complete
 
 Note: The input file MUST be a BIDS-compliant participants.tsv file (tab-separated)
       containing 'participant_id' and 'session_id' columns.

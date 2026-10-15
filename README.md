@@ -7,10 +7,16 @@ PyQt6 app that tracks BCP sessions through the processing pipeline and lets you 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python pipeline_tracker.py --input data_that_work/bcp_participants.tsv
+python pipeline_tracker.py --participants_tsv data_that_work/bcp_participants.tsv
+python pipeline_tracker.py --help
 ```
 
-`--input` is a BIDS `participants.tsv` with `participant_id` and `session_id` columns; it is the canonical session list. Optional `--stages` limits the pipeline columns.
+| Option | Meaning |
+|---|---|
+| `--participants_tsv FILE` | BIDS `participants.tsv` with `participant_id` and `session_id` columns; the canonical session list. Required unless `--session` is given. (`--input` still works as an alias.) |
+| `--data_dir DIR` | Import every schema-named CSV under DIR at startup (recursive). |
+| `--session FILE` | Restore a saved session (see below). |
+| `--stages ...` | Limit the pipeline columns. |
 
 ## CSV naming schema
 
@@ -67,9 +73,21 @@ Sessions that appear in an imported file but not in `participants.tsv` are skipp
 
 Filter by recon, overall result, XCP-D success, and thresholds on any score column (averages and pass counts are minimums, fail counts are maximums). **Export Matching Sessions** writes the filtered rows to CSV.
 
+## Views and tools
+
+- **Pipeline View** has a filter bar: search by session ID (space/comma separated), current stage, status of the current stage, error-query file, and "has notes". "Showing X of Y" tells you what is visible.
+- **Overview / Error Summary** show counts per stage and per error-query file (for the selected versions).
+- **Version Comparison** picks a stage and two versions (A, B) and lists sessions whose status differs, labelled `improved` (B succeeded), `regressed`, `changed`, `only_in_a` or `only_in_b`.
+- **Summary** is a text report: complete vs. not complete, where incomplete sessions stopped, success/error/pending/no-data per stage and version, sessions not in `participants.tsv` per file. **Save report** writes the `.txt` plus `<name>_incomplete.csv`.
+- **Export Current View** writes what the current view shows to CSV (filtered sessions, BrainSwipes selection, version comparison) or saves the summary report. Session exports include the selected version and status of each stage, BrainSwipes result, error files and notes.
+- **Import Folder** imports every CSV under a folder that follows the naming schema; others are listed as skipped, with the expected pattern.
+- **Save Session / Load Session** store the participants file, the imported CSVs (absolute path, with a path relative to the session file as fallback) and the selected versions as JSON. Loading starts clean and re-imports; missing files are reported and printed as `[WARNING]`.
+
+Imports check columns and give a specific message when a file lacks participant/session ID columns, or (for tracking CSVs) all of `pending`/`success`/`errored`, or (for error CSVs) both `Run_Number` and `Error_Log_Paths`.
+
 ## Tests
 
 ```bash
-pip install pytest
+pip install -r requirements-dev.txt
 pytest tests
 ```
