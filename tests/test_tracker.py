@@ -15,7 +15,7 @@ DATA = ROOT / "all_datasheets"
 SAMPLES = DATA
 BS_RESULTS = SAMPLES / "Jul-30_results_brainswipes_report.csv"
 BS_PASSABLE = SAMPLES / "Jul-30_passable_brainswipes_report.csv"
-XCPD_ERRORS = SAMPLES / "Oct-15_pilot_xcpd_v0.10.7_error_report_no_low_motion_runs.csv"
+XCPD_ERRORS = SAMPLES / "Oct-15_main_folder_xcpd_v0.10.7_error_report_no_low_motion_runs.csv"
 
 
 @pytest.fixture(scope="session")
@@ -27,7 +27,7 @@ def app():
 def window(app, tmp_path):
     w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
     for name in ["Oct-15_pilot_mriqc_v1_audit_report_best_anatomical.csv", "Oct-15_pilot_mriqc_v1_audit_report_anat_counts.csv",
-                 "Oct-15_pilot_bibsnet_v3.4.1_audit_report.csv", "Oct-15_pilot_nibabies_v25.0.1_audit_report.csv", "Oct-15_pilot_xcpd_v0.10.7_audit_report.csv"]:
+                 "Oct-15_pilot_bibsnet_v3.4.1_audit_report.csv", "Mar-20_main_folder_nibabies_v25.0.1_audit_report.csv", "Mar-20_main_folder_xcpd_v0.10.7_audit_report.csv"]:
         w.import_file(str(DATA / name))
     w.tmp_path = tmp_path
     return w
@@ -70,7 +70,7 @@ def test_xcp_d_success_is_complete(window):
 
 def test_import_order_does_not_matter(app, tmp_path):
     w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
-    for name in ["Oct-15_pilot_xcpd_v0.10.7_audit_report.csv", "Oct-15_pilot_nibabies_v25.0.1_audit_report.csv",
+    for name in ["Mar-20_main_folder_xcpd_v0.10.7_audit_report.csv", "Mar-20_main_folder_nibabies_v25.0.1_audit_report.csv",
                  "Oct-15_pilot_bibsnet_v3.4.1_audit_report.csv", "Oct-15_pilot_mriqc_v1_audit_report_anat_counts.csv"]:
         w.import_file(str(DATA / name))
     assert stage_counts(w)["Complete"] > 0
@@ -82,7 +82,7 @@ def test_version_toggle_changes_tracking(window):
     failing.write_text("participant_id,session_id,pending,success,errored\n" + "\n".join(
         f"{pid},{sid},FALSE,FALSE,TRUE" for pid, sid in window.sessions) + "\n")
     window.import_file(str(failing))
-    assert window.versions("XCP-D") == ["pilot_v0.10.7", "new_v0.11.0"]
+    assert window.versions("XCP-D") == ["main_folder_v0.10.7", "new_v0.11.0"]
     assert stage_counts(window) == before  # first imported version stays selected
 
     window.active_versions["XCP-D"] = "new_v0.11.0"
@@ -91,7 +91,7 @@ def test_version_toggle_changes_tracking(window):
     assert after["Complete"] == 0
     assert after["XCP-D"] == before["Complete"] + before["XCP-D"]
 
-    window.active_versions["XCP-D"] = "pilot_v0.10.7"
+    window.active_versions["XCP-D"] = "main_folder_v0.10.7"
     window.recompute()
     assert stage_counts(window) == before
 
@@ -138,7 +138,7 @@ def test_unknown_sessions_warn_on_terminal(window, capsys):
 
 
 def test_errors_are_per_version_and_deduplicated(window):
-    err = str(XCPD_ERRORS)  # version "pilot_v0.10.7", the active XCP-D version
+    err = str(XCPD_ERRORS)  # version "main_folder_v0.10.7", the active XCP-D version
     window.import_file(err)
     window.import_file(err)
 
@@ -154,12 +154,12 @@ def test_errors_are_per_version_and_deduplicated(window):
     window.active_versions["XCP-D"] = "anat_rerun_v0.10.7"
     window.recompute()
     assert "anat_rerun_v0.10.7" in window.versions("XCP-D")
-    window.active_versions["XCP-D"] = "pilot_v0.10.7"
+    window.active_versions["XCP-D"] = "main_folder_v0.10.7"
     window.recompute()
     assert s.errors.get("XCP-D")
 
     # a later success for the same version clears its errors
-    s.set_status("XCP-D", "pilot_v0.10.7", "success")
+    s.set_status("XCP-D", "main_folder_v0.10.7", "success")
     window.recompute()
     assert not s.errors.get("XCP-D") and s.current_stage == "Complete"
 
@@ -196,9 +196,9 @@ def test_every_sample_file_follows_schema_and_imports(window):
     for path in paths:
         assert pt.parse_csv_filename(str(path)), f"{path.name} does not follow the naming schema"
         window.import_file(str(path))
-    assert window.versions("Nibabies")[0] == "pilot_v25.0.1"
-    assert set(window.versions("Nibabies")) >= {"pilot_v25.0.1", "anat_only_v25.0.1", "corrected_anat_runs_v25.0.1", "extra_mcribs_v25.0.1"}
-    assert set(window.versions("XCP-D")) >= {"pilot_v0.10.7", "anat_rerun_v0.10.7"}
+    assert "main_folder_v25.0.1" in window.versions("Nibabies")
+    assert set(window.versions("Nibabies")) >= {"main_folder_v25.0.1", "anat_only_v25.0.1", "corrected_anat_runs_v25.0.1", "extra_mcribs_v25.0.1"}
+    assert set(window.versions("XCP-D")) >= {"main_folder_v0.10.7", "anat_rerun_v0.10.7"}
     assert window.versions("MRIQC") == ["pilot_v1"]
     window.rebuild_version_controls()
     for view in (window.show_pipeline_view, window.show_overview,
@@ -237,7 +237,7 @@ def test_filter_widgets_drive_pipeline_view(window):
 
 def test_error_filter(window):
     import_errors(window)
-    window.active_versions["XCP-D"] = "pilot_v0.10.7"
+    window.active_versions["XCP-D"] = "main_folder_v0.10.7"
     window.recompute()
     names = window.error_csv_names()
     assert names
@@ -260,7 +260,7 @@ def test_summary(window):
     assert d["total"] == len(window.sessions)
     assert d["complete"] + len(d["incomplete"]) == d["total"]
     text = window.summary_text()
-    assert "Per stage and version" in text and "pilot_v0.10.7*" in text
+    assert "Per stage and version" in text and "main_folder_v0.10.7*" in text
     paths = window.save_summary(str(window.tmp_path / "rep.txt"))
     import pandas as pd
     assert len(pd.read_csv(paths[1])) == len(d["incomplete"])
@@ -268,11 +268,11 @@ def test_summary(window):
 
 def test_version_comparison(window):
     import_errors(window)
-    rows = window.compare_versions("XCP-D", "pilot_v0.10.7", "anat_rerun_v0.10.7")
+    rows = window.compare_versions("XCP-D", "main_folder_v0.10.7", "anat_rerun_v0.10.7")
     assert rows and all(r["status_a"] != r["status_b"] for r in rows)
     assert {r["change"] for r in rows} <= {"only_in_a", "only_in_b", "improved", "regressed", "changed"}
     window.switch_view("Version Comparison")
-    window.comparison.update(stage="XCP-D", a="pilot_v0.10.7", b="anat_rerun_v0.10.7")
+    window.comparison.update(stage="XCP-D", a="main_folder_v0.10.7", b="anat_rerun_v0.10.7")
     out = window.tmp_path / "cmp.csv"
     window.view_combo.setCurrentText("Version Comparison")
     window.export_current_view(str(out))
@@ -314,7 +314,7 @@ def test_import_folder(app):
     w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
     summaries = w.import_folder(str(SAMPLES))
     assert any("FAILED" not in t and "skipped" not in t for t in summaries)
-    assert {"pilot_v25.0.1", "anat_only_v25.0.1", "corrected_anat_runs_v25.0.1", "extra_mcribs_v25.0.1"} <= set(w.versions("Nibabies"))
+    assert {"main_folder_v25.0.1", "anat_only_v25.0.1", "corrected_anat_runs_v25.0.1", "extra_mcribs_v25.0.1"} <= set(w.versions("Nibabies"))
 
 
 def test_import_folder_skips_unnamed_files(app, tmp_path):
@@ -369,3 +369,10 @@ def test_import_audit_report_folder(window):
     window.active_versions["Nibabies"] = "main_folder_v25.0.1"
     window.recompute()
     assert sum(s.stage_status["Nibabies"] == "success" for s in window.sessions.values()) == 864
+
+
+def test_import_folder_skips_outdated(app):
+    w = pt.PipelineTrackerWindow(str(DATA / "bcp_participants.tsv"), None)
+    w.import_folder(str(DATA))
+    assert "pilot_v25.0.1" not in w.versions("Nibabies")
+    assert "main_folder_v25.0.1" in w.versions("Nibabies")

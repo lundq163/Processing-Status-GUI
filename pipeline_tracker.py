@@ -1066,12 +1066,14 @@ class PipelineTrackerWindow(QMainWindow):
         return summaries
 
     def import_folder(self, folder: str = None) -> List[str]:
-        """Imports every CSV under a folder (recursively) that follows the naming schema."""
+        """Imports every CSV under a folder (recursively, skipping any folder named "outdated") that
+        follows the naming schema."""
         if folder is None:
             folder = QFileDialog.getExistingDirectory(self, "Import folder of CSVs")
             if not folder:
                 return []
-        files = sorted(str(f) for f in Path(folder).rglob("*.csv"))
+        files = sorted(str(f) for f in Path(folder).rglob("*.csv")
+                       if not any(part.lower() == "outdated" for part in f.relative_to(folder).parts[:-1]))
         summaries = self.import_paths(files, ask=False)
         if not files:
             summaries = [f"No CSV files found in {folder}"]
