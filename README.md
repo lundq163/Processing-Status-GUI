@@ -46,6 +46,8 @@ brainswipes__30July__audit.csv
 notes__unfindable__audit.csv
 ```
 
+The audit-report format `{date}_{output folder}_{nibabies|xcpd}_v{pipeline version}_audit_report.csv` (columns `sub_id`, `ses_id`, `crash_log`, `exec_sum`, `status`) is also recognized as-is, for example `Mar-20_main_folder_xcpd_v0.10.7_audit_report.csv`. Its version is `{output folder}_v{pipeline version}` (`main_folder_v0.10.7`), so each output folder is a selectable version. `success?` is success; a crash log or an `exec_sum` other than `NO_OUTPUTS` with no success is an error; `NO_OUTPUTS` means the session was not run in that folder (pending).
+
 Files that do not match prompt for stage, version, and type when imported. Several files can be selected at once.
 
 ## Versions

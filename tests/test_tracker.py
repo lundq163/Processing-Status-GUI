@@ -339,3 +339,31 @@ def test_cli_accepts_participants_tsv_and_alias(monkeypatch):
     with pytest.raises(SystemExit) as e:
         pt.main()
     assert e.value.code == 2
+
+
+AUDIT_REPORTS = ROOT / "bcp_processing_audit_tests_Mar20-2026"
+
+
+def test_parse_audit_report_filename():
+    spec = pt.parse_csv_filename("Mar-20_mcribs-4to8_xcpd_v0.10.7_audit_report.csv")
+    assert spec == {"stage": "XCP-D", "version": "mcribs-4to8_v0.10.7", "kind": "audit", "label": ""}
+    spec = pt.parse_csv_filename("Mar-20_main_folder_nibabies_v25.0.1_audit_report.csv")
+    assert spec["stage"] == "Nibabies" and spec["version"] == "main_folder_v25.0.1"
+
+
+def test_audit_report_status_rules():
+    f = pt.PipelineTrackerWindow._audit_report_status
+    assert f({"status": "success?", "exec_sum": "FOUND_EXEC-SUM", "crash_log": ""}) == "success"
+    assert f({"status": "failed?", "exec_sum": "NO_OUTPUTS", "crash_log": ""}) == "pending"
+    assert f({"status": "failed?", "exec_sum": "NO_EXEC-SUM", "crash_log": ""}) == "error"
+    assert f({"status": "failed?", "exec_sum": "NO_OUTPUTS", "crash_log": "x.txt"}) == "error"
+
+
+@pytest.mark.skipif(not AUDIT_REPORTS.exists(), reason="audit report folder not present")
+def test_import_audit_report_folder(window):
+    summaries = window.import_folder(str(AUDIT_REPORTS))
+    assert not any("FAILED" in t or "skipped" in t for t in summaries)
+    assert {"main_folder_v25.0.1", "reproc-mfc_v25.0.1"} <= set(window.versions("Nibabies"))
+    window.active_versions["Nibabies"] = "main_folder_v25.0.1"
+    window.recompute()
+    assert sum(s.stage_status["Nibabies"] == "success" for s in window.sessions.values()) == 864

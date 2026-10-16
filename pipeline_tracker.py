@@ -190,9 +190,9 @@ def filter_brainswipes(sessions, recon=None, overall=None, minimums=None, maximu
     return out
 
 
-PID_KEYS = ['participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub']
-SID_KEYS = ['session_id', 'Session_IDs', 'session', 'ses', 'sess']
-STATUS_COLUMNS = ['pending', 'success', 'errored']
+PID_KEYS = ['sub_id', 'participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub']
+SID_KEYS = ['ses_id', 'session_id', 'Session_IDs', 'session', 'ses', 'sess']
+STATUS_COLUMNS = ['pending', 'success', 'errored', 'status']
 ERROR_COLUMNS = ['Run_Number', 'Error_Log_Paths']
 FILENAME_SCHEMA = "{stage}__{version}__{audit|errors}[__label].csv"
 
@@ -234,9 +234,21 @@ class ImportReport:
 # DATA MODELS
 # ============================================================================
 
+AUDIT_REPORT_NAME = re.compile(
+    r"^(?:[A-Za-z]{3}-\d{1,2}_)?(?P<folder>.+)_(?P<tool>nibabies|xcpd)_v(?P<ver>[\w.\-]+)_audit_report$",
+    re.IGNORECASE)
+
+
 def parse_csv_filename(path: str) -> Optional[Dict[str, str]]:
     """Parses the required CSV naming schema: {stage}__{version}__{audit|errors}[__label].csv
     Returns {"stage", "version", "kind", "label"} or None if the name does not follow the schema."""
+    audit_report = AUDIT_REPORT_NAME.match(Path(path).stem)
+    if audit_report:
+        # {date}_{output folder}_{pipeline}_v{pipeline version}_audit_report.csv: the output
+        # folder and pipeline version together identify the version
+        g = audit_report.groupdict()
+        return {"stage": PipelineConfig.STAGE_TOKENS[g["tool"].lower()],
+                "version": f"{g['folder']}_v{g['ver']}", "kind": "audit", "label": ""}
     parts = Path(path).stem.split("__")
     if len(parts) < 3:
         return None
@@ -1180,6 +1192,19 @@ class PipelineTrackerWindow(QMainWindow):
                 session.set_status(stage, version, "success" if has_counts else "error")
             report.updated += 1
 
+    @staticmethod
+    def _audit_report_status(row) -> str:
+        """Status from the audit-report format (sub_id, ses_id, crash_log, exec_sum, status).
+        'success?' is success. A failure with no outputs at all means the session was not run in
+        that folder (pending); a crash log or outputs without an execution summary is an error."""
+        value = str(row.get('status', '')).strip().lower().rstrip('?')
+        if value == 'success':
+            return "success"
+        exec_sum = str(row.get('exec_sum', '')).strip().upper()
+        if str(row.get('crash_log', '')).strip() or (exec_sum and exec_sum != 'NO_OUTPUTS'):
+            return "error"
+        return "pending"
+
     def _import_status_stage(self, file_path: str, stage: str, version: str, report: ImportReport):
         """Imports a pending/success/errored tracking CSV for BIBSNet, Nibabies or XCP-D."""
         id_like = {'participant_id', 'Subject_IDs', 'subject_id', 'participant', 'subject', 'sub',
@@ -1188,7 +1213,10 @@ class PipelineTrackerWindow(QMainWindow):
             session.update_stage_data(stage, version,
                                       {c: row[c] for c in self._current_columns if c not in id_like})
             flag = lambda col: str(row.get(col, '')).strip().upper() == 'TRUE'
-            status = "error" if flag('errored') else "success" if flag('success') else "pending"
+            if 'status' in self._current_columns:
+                status = self._audit_report_status(row)
+            else:
+                status = "error" if flag('errored') else "success" if flag('success') else "pending"
             session.set_status(stage, version, status)
             report.updated += 1
 
