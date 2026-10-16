@@ -26,29 +26,34 @@ python pipeline_tracker.py --help
 Every CSV you import should be named:
 
 ```text
-{stage}__{version}__{audit|errors}[__label].csv
+{date}_{output_folder}_{tool}_v{version}_{audit|error}_report[_{label}].csv
+{date}_{description}_{brainswipes|notes}_report.csv
 ```
 
-- `stage`: `mriqc`, `bibsnet`, `nibabies`, `xcpd`, `brainswipes`, or `notes`
-- `version`: free text identifying the pipeline run, with no double underscores (for example `25.0.1`, `anat_only`, `0.10.7`). Ignored for `brainswipes` and `notes`, but still required.
-- `audit` or `errors`: audit/tracking output, or error-query output (pipeline stages only)
-- `label`: optional; use it to tell apart several files of the same kind (for example the error category)
+- `date`: one token without underscores that contains a digit, for example `Mar-20` or `2026-03-20`
+- `output_folder`: the processing output folder the audit covers (`main_folder`, `reproc-mfc`, `mcribs-4to8`, `infantfs_gt24mo`, ...). Underscores are allowed.
+- `tool`: `mriqc`, `bibsnet`, `nibabies` or `xcpd`
+- `version`: the pipeline version after a literal `v` (`v25.0.1`, `v0.10.7`); no underscores
+- `audit` or `error`: audit/tracking output, or error-query output (pipeline tools only)
+- `label`: optional; tells apart several files of the same kind (the MRIQC table type, the error category)
+- `description` (brainswipes, notes): free text such as `results` or `passable`; these are not tied to a pipeline version
+
+The **version** shown in the GUI is `{output_folder}_v{version}` (for example `main_folder_v0.10.7`). Audit and error files with the same output folder and version overlay each other, and each output folder is its own selectable version.
 
 Examples:
 
 ```text
-mriqc__v1__audit__counts.csv
-bibsnet__v1__audit.csv
-nibabies__25.0.1__audit.csv
-nibabies__anat_only__errors__node_execution.csv
-xcpd__0.10.7__errors__no_low_motion_runs.csv
-brainswipes__30July__audit.csv
-notes__unfindable__audit.csv
+Mar-20_main_folder_nibabies_v25.0.1_audit_report.csv
+Mar-20_reproc-mfc_xcpd_v0.10.7_audit_report.csv
+Mar-20_main_folder_nibabies_v25.0.1_error_report_node_execution.csv
+Oct-15_pilot_mriqc_v1_audit_report_anat_counts.csv
+Jul-30_results_brainswipes_report.csv
+Oct-15_unfindable_notes_report.csv
 ```
 
-The audit-report format `{date}_{output folder}_{nibabies|xcpd}_v{pipeline version}_audit_report.csv` (columns `sub_id`, `ses_id`, `crash_log`, `exec_sum`, `status`) is also recognized as-is, for example `Mar-20_main_folder_xcpd_v0.10.7_audit_report.csv`. Its version is `{output folder}_v{pipeline version}` (`main_folder_v0.10.7`), so each output folder is a selectable version. `success?` is success; a crash log or an `exec_sum` other than `NO_OUTPUTS` with no success is an error; `NO_OUTPUTS` means the session was not run in that folder (pending).
+Audit-report columns are `sub_id`, `ses_id`, `crash_log`, `exec_sum`, `status` (the older `participant_id`/`session_id`/`pending`/`success`/`errored` columns still work). `success?` is success; a crash log or an `exec_sum` other than `NO_OUTPUTS` with no success is an error; `NO_OUTPUTS` means the session was not run in that folder (pending).
 
-Files that do not match prompt for stage, version, and type when imported. Several files can be selected at once.
+Files that do not match prompt for stage, version, and type when imported (with Import Folder they are skipped and listed). Several files can be selected at once.
 
 ## Versions
 

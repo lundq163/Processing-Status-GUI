@@ -69,8 +69,7 @@ class PipelineConfig:
     # Version used by sources that are not versioned
     UNVERSIONED = "all"
 
-    # Filename prefix -> stage for the CSV naming schema:
-    #   {stage}__{version}__{audit|errors}[__label].csv
+    # Tool token in the file name -> stage (see FILENAME_SCHEMA)
     STAGE_TOKENS = {
         "mriqc": "MRIQC",
         "bibsnet": "BIBSNet",
@@ -194,15 +193,14 @@ PID_KEYS = ['sub_id', 'participant_id', 'Subject_IDs', 'subject_id', 'participan
 SID_KEYS = ['ses_id', 'session_id', 'Session_IDs', 'session', 'ses', 'sess']
 STATUS_COLUMNS = ['pending', 'success', 'errored', 'status']
 ERROR_COLUMNS = ['Run_Number', 'Error_Log_Paths']
-FILENAME_SCHEMA = "{stage}__{version}__{audit|errors}[__label].csv"
+FILENAME_SCHEMA = ("{date}_{output_folder}_{tool}_v{version}_{audit|error}_report[_{label}].csv, or "
+                   "{date}_{description}_{brainswipes|notes}_report.csv")
 
 
 def schema_help() -> str:
     """Accepted filename pattern and stage tokens, for validation messages."""
-    return (f"Expected {FILENAME_SCHEMA} with stage one of: "
-            + ", ".join(PipelineConfig.STAGE_TOKENS) + " (errors only for "
-            + ", ".join(t for t, st in PipelineConfig.STAGE_TOKENS.items()
-                        if st in PipelineConfig.VERSIONED_STAGES) + ")")
+    return (f"Expected {FILENAME_SCHEMA}, e.g. Mar-20_main_folder_xcpd_v0.10.7_audit_report.csv. "
+            "Tools: " + ", ".join(PipelineConfig.STAGE_TOKENS))
 
 
 class ImportReport:
@@ -234,31 +232,37 @@ class ImportReport:
 # DATA MODELS
 # ============================================================================
 
-AUDIT_REPORT_NAME = re.compile(
-    r"^(?:[A-Za-z]{3}-\d{1,2}_)?(?P<folder>.+)_(?P<tool>nibabies|xcpd)_v(?P<ver>[\w.\-]+)_audit_report$",
+# {date}_{output folder}_{tool}_v{version}_{audit|error}_report[_{label}].csv; the date is one
+# token without underscores that contains a digit (Mar-20, 2026-03-20)
+REPORT_NAME = re.compile(
+    r"^(?P<date>[^_\d]*\d[^_]*)_(?P<folder>.+?)_(?P<tool>mriqc|bibsnet|nibabies|xcpd)_v(?P<ver>[^_]+)"
+    r"_(?P<kind>audit|error)_report(?:_(?P<label>.+))?$", re.IGNORECASE)
+# {date}_{description}_{brainswipes|notes}_report.csv (not tied to a pipeline version)
+OVERLAY_NAME = re.compile(
+    r"^(?P<date>[^_\d]*\d[^_]*)_(?P<folder>.+?)_(?P<tool>brainswipes|notes)_report(?:_(?P<label>.+))?$",
     re.IGNORECASE)
 
 
 def parse_csv_filename(path: str) -> Optional[Dict[str, str]]:
-    """Parses the required CSV naming schema: {stage}__{version}__{audit|errors}[__label].csv
-    Returns {"stage", "version", "kind", "label"} or None if the name does not follow the schema."""
-    audit_report = AUDIT_REPORT_NAME.match(Path(path).stem)
-    if audit_report:
-        # {date}_{output folder}_{pipeline}_v{pipeline version}_audit_report.csv: the output
-        # folder and pipeline version together identify the version
-        g = audit_report.groupdict()
+    """Parses the required CSV naming schema (see FILENAME_SCHEMA). Returns
+    {"stage", "version", "kind", "label", "date", "folder"} or None if the name does not follow it.
+    For pipeline stages the version is "{output folder}_v{pipeline version}", so audit and error
+    files from the same output folder and pipeline version land on the same selectable version."""
+    stem = Path(path).stem
+    m = REPORT_NAME.match(stem)
+    if m:
+        g = m.groupdict()
         return {"stage": PipelineConfig.STAGE_TOKENS[g["tool"].lower()],
-                "version": f"{g['folder']}_v{g['ver']}", "kind": "audit", "label": ""}
-    parts = Path(path).stem.split("__")
-    if len(parts) < 3:
-        return None
-    token, version, kind = parts[0].lower(), parts[1], parts[2].lower()
-    stage = PipelineConfig.STAGE_TOKENS.get(token)
-    if stage is None or not version or kind not in ("audit", "errors"):
-        return None
-    if kind == "errors" and stage not in PipelineConfig.VERSIONED_STAGES:
-        return None
-    return {"stage": stage, "version": version, "kind": kind, "label": "__".join(parts[3:])}
+                "version": f"{g['folder']}_v{g['ver']}",
+                "kind": "errors" if g["kind"].lower() == "error" else "audit",
+                "label": g["label"] or "", "date": g["date"], "folder": g["folder"]}
+    m = OVERLAY_NAME.match(stem)
+    if m:
+        g = m.groupdict()
+        return {"stage": PipelineConfig.STAGE_TOKENS[g["tool"].lower()],
+                "version": PipelineConfig.UNVERSIONED, "kind": "audit",
+                "label": g["label"] or "", "date": g["date"], "folder": g["folder"]}
+    return None
 
 
 class SessionData:
@@ -1033,7 +1037,7 @@ class PipelineTrackerWindow(QMainWindow):
             dialog.exec()
     
     def import_csv(self, kind: str = None):
-        """Imports one or more CSVs. Files named {stage}__{version}__{audit|errors}[__label].csv
+        """Imports one or more CSVs. Files that follow FILENAME_SCHEMA
         are routed automatically; any other file prompts for stage, version and type."""
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Import CSV(s)", "", "CSV Files (*.csv)")
         if file_paths:
@@ -1280,13 +1284,13 @@ class PipelineTrackerWindow(QMainWindow):
         dialog.setMinimumWidth(380)
         layout = QVBoxLayout()
         layout.addWidget(QLabel(f"'{filename}' does not follow<br>"
-                                "<code>{stage}__{version}__{audit|errors}[__label].csv</code>"))
+                                "<code>{date}_{output_folder}_{tool}_v{version}_{audit|error}_report.csv</code>"))
         layout.addWidget(QLabel("Choose how to import it, or skip it. Rename it to avoid this prompt."))
 
         stage_combo = QComboBox()
         stage_combo.addItems(PipelineConfig.VERSIONED_STAGES + PipelineConfig.OVERLAY_STAGES)
         version_edit = QLineEdit()
-        version_edit.setPlaceholderText("pipeline version, e.g. 25.0.1")
+        version_edit.setPlaceholderText("output folder + version, e.g. main_folder_v25.0.1")
         kind_combo = QComboBox()
         kind_combo.addItems(["audit", "errors"])
         if kind:
@@ -1737,8 +1741,9 @@ Examples:
   python pipeline_tracker.py --participants_tsv participants.tsv --data_dir ./audit_outputs
   python pipeline_tracker.py --session tracker_session.json
 
-CSV files must be named {stage}__{version}__{audit|errors}[__label].csv
-(stage: mriqc, bibsnet, nibabies, xcpd, brainswipes, notes). See README.md.
+CSV files must be named {date}_{output_folder}_{tool}_v{version}_{audit|error}_report.csv
+(tool: mriqc, bibsnet, nibabies, xcpd; brainswipes and notes use
+{date}_{description}_{tool}_report.csv). See README.md.
         """
     )
 
